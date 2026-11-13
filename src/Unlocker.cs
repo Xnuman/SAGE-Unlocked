@@ -16,7 +16,7 @@ using System.Threading;
 
 static class Program
 {
-    public const string Version = "1.9.5";   // keep in step with installer/setup.iss
+    public const string Version = "1.9.5-netsync";   // keep in step with installer/setup.iss (fork: netsync test build)
     const uint ImageBase = 0x400000;
 
     // called from inside the game (dll/proxy.c)
@@ -24,6 +24,7 @@ static class Program
     {
         int r = Patch(IntPtr.Zero, Process.GetCurrentProcess().MainModule.FileName, dir, "drop-in DLL");
         if (r == 1 && ReadIni(IniFile(dir), "crcdump") == "1") new Thread(() => CrcDump(dir)) { IsBackground = true }.Start();
+        if (r == 1 && netsyncData != 0) new Thread(() => NetsyncLog(dir)) { IsBackground = true }.Start();
         return r;
     }
 
@@ -111,6 +112,7 @@ static class Program
             skip = (ReadIni(ini, "skip") ?? "").ToLowerInvariant();
             realclockOpt = ReadIni(ini, "realclock") == "1";   // effects on real time: opt-in until its crash is found
             offscreenAnim = ReadIni(ini, "offscreenanim") == "1";
+            netsyncOpt = ReadIni(ini, "netsync") == "1";   // bfme2 online pacing fix, opt-in while it's being tested
             // bfme2: same engine family, its own code shapes (cdq/idiv), so its own path
             BfmeSites bfme = Scan(img, FrameMsSig).Count == 0 ? FindBfme(img) : null;
             if (bfme != null)
@@ -1106,7 +1108,17 @@ static class Program
     // (every 66.67ms, in 1/3ms units so it's exact), run whatever phases are due each frame, and set
     // interp from the time so movement stays smooth
     // PreGlobal/PreOff/PreFn: bfme2 calls PreFn([[PreGlobal]+PreOff] * 10 + phase - 1) before each dispatch
-    class SchedSite { public uint Advance, Exit, TimeFn; public byte Phase, Interp; public uint Dispatch; public uint PreGlobal, PreFn; public byte PreOff; public int Tick = 200; public uint FfGlobal, FfOff; }   // Tick: logic tick in 1/3 ms (200 = 15 hz, 600 = 5 hz)
+    class SchedSite { public uint Advance, Exit, TimeFn; public byte Phase, Interp; public uint Dispatch; public uint PreGlobal, PreFn; public byte PreOff; public int Tick = 200; public uint FfGlobal, FfOff;
+        public uint NetScale, NetData; }   // Tick: logic tick in 1/3 ms (200 = 15 hz, 600 = 5 hz). NetScale/NetData: bfme2 netsync=1 (see PatchScheduler)
+
+    // netsync=1 (bfme2, testing): online, stock bfme2 slows the whole game down by slowing its frames, its limiter waits
+    // 1000 / (max fps * netscale). the scheduler started ticks off the wall clock and never looked at netscale, so when the
+    // network wanted a slower pace ticks kept getting held back, and when one finally went through the schedule was behind
+    // and caught up: several phases or ticks in one frame, units jumping (#20, multiplayer only). netsync: the scheduler's
+    // clock runs at real time * netscale, and a tick that starts late re-anchors the schedule instead of catching up
+    static bool netsyncOpt;
+    static uint netsyncData;   // patch memory with the counters below, read by the netsync log thread
+    const int NsLastMs = 0x00, NsInit = 0x04, NsNow = 0x08, NsFrac = 0x0C, NsScale = 0x10, NsTicks = 0x14, NsHeld = 0x18, NsLate = 0x1C, NsK65536 = 0x20, NsClockFn = 0x40;   // clock function at +40h, up to C0h bytes
 
     const string SchedPatternA = "8B 0D ?? ?? ?? ?? BB 01 00 00 00 88 99 C4 00 00 00 8B 4E 58 83 F9 06 75 1A 80 7E 64 00 74 14 A1 ?? ?? ?? ?? 33 D2 F7 35";
     const string SchedPatternB = "8B 16 50 8B 82 90 00 00 00 8B CE FF D0 8B 0D ?? ?? ?? ?? 8B 11 8B 82 A0 00 00 00 5F 5E 5B 83 C4 04";
@@ -1213,7 +1225,42 @@ static class Program
         if (site.FfGlobal != 0) { a.E(0xA1); a.D(site.FfGlobal); a.E(0x85, 0xC0); a.J(0x74, "noff"); a.E(0x80, 0xB8); a.D(site.FfOff); a.E(0x00); a.J(0x75, "pass"); a.L("noff"); }
         a.E(0xA1); a.D(fpsVa); a.E(0x33, 0xD2, 0xB9, 0x0F, 0, 0, 0, 0xF7, 0xF1); a.E(0xA3); a.D(r);   // r = fps / 15
         a.Rel(0xE8, site.TimeFn);                                   // eax = ms (timeGetTime)
-        a.E(0x8D, 0x04, 0x40); a.E(0xA3); a.D(now3);                 // now3 = ms * 3
+        uint ns = site.NetData;
+        if (ns == 0) { a.E(0x8D, 0x04, 0x40); a.E(0xA3); a.D(now3); }   // now3 = ms * 3
+        else
+        {
+            // netsync: now3 = a clock in 1/3 ms that runs at real time * netscale. integer 16.16 fixed point, the fpu
+            // only turns netscale into it (d3d9 usually puts the fpu in single precision, a float clock would drift).
+            // its own function next to its data, stub A has no room: eax = ms in, eax = clock out, ecx clobbered
+            uint clock = ns + NsClockFn;
+            var c = new Asm(clock);
+            c.E(0x80, 0x3D); c.D(ns + NsInit); c.E(0x00); c.J(0x75, "init");            // first call: start at ms * 3
+            c.E(0xC6, 0x05); c.D(ns + NsInit); c.E(0x01);
+            c.E(0xA3); c.D(ns + NsLastMs);
+            c.E(0x8D, 0x0C, 0x40, 0x89, 0x0D); c.D(ns + NsNow);                          // lea ecx,[eax*3] / mov [vnow],ecx
+            c.L("init");
+            c.E(0x8B, 0xC8, 0x2B, 0x0D); c.D(ns + NsLastMs);                             // ecx = ms - lastMs
+            c.E(0xA3); c.D(ns + NsLastMs);
+            c.E(0x85, 0xC9); c.J(0x7D, "pos"); c.E(0x33, 0xC9);                         // clamp 0..1000 ms
+            c.L("pos");
+            c.E(0x81, 0xF9); c.D(1000); c.J(0x7E, "ok"); c.E(0xB9); c.D(1000);
+            c.L("ok");
+            c.E(0xD9, 0x05); c.D(site.NetScale); c.E(0xD8, 0x0D); c.D(ns + NsK65536);   // fld [netscale] / fmul [65536f]
+            c.E(0xDB, 0x1D); c.D(ns + NsScale);                                          // fistp [scale]
+            c.E(0xA1); c.D(ns + NsScale);
+            c.E(0x3D); c.D(6554); c.J(0x7C, "bad");                                      // under 0.1 (or nan/garbage): 1.0
+            c.E(0x3D); c.D(131072); c.J(0x7E, "good");                                   // over 2.0: 1.0
+            c.L("bad");
+            c.E(0xB8); c.D(65536); c.E(0xA3); c.D(ns + NsScale);
+            c.L("good");
+            c.E(0x8D, 0x0C, 0x49, 0x0F, 0xAF, 0xC8);                                     // ecx = delta * 3 * scale
+            c.E(0x03, 0x0D); c.D(ns + NsFrac);                                           // + leftover fraction
+            c.E(0x8B, 0xC1, 0xC1, 0xE8, 0x10, 0x01, 0x05); c.D(ns + NsNow);              // vnow += ecx >> 16
+            c.E(0x81, 0xE1); c.D(0xFFFF); c.E(0x89, 0x0D); c.D(ns + NsFrac);             // frac = ecx & ffff
+            c.E(0xA1); c.D(ns + NsNow); c.E(0xC3);                                       // eax = vnow / ret
+            Write(proc, clock, c.Done(0xC0));
+            a.Rel(0xE8, clock); a.E(0xA3); a.D(now3);                                   // now3 = clock
+        }
         a.E(0x83, 0x3D); a.D(t0); a.E(0x00); a.J(0x75, "have");     // first run
         a.E(0xA3); a.D(t0);
         a.L("have");
@@ -1222,6 +1269,7 @@ static class Program
         a.E(0xC7, 0x05); a.D(pend); a.D(0);
         a.E(0x83, 0xF9, 0x06); a.J(0x72, "nopend");                 // wrapped = it started
         a.E(0x81, 0x2D); a.D(t0); a.D((uint)T);                      // network held it back, undo
+        if (ns != 0) { a.E(0xFF, 0x05); a.D(ns + NsHeld); }          // netsync log: held back count
         a.L("nopend");
         a.E(0x8B, 0xD0, 0x2B, 0x15); a.D(t0);                        // edx = t = now3 - tickStart
         a.E(0x50, 0x2B, 0x05); a.D(prevA);                           // push eax / eax = frame length
@@ -1237,6 +1285,17 @@ static class Program
         a.E(0x81, 0x05); a.D(t0); a.D((uint)T);                      // tickStart += one tick
         a.E(0xA3); a.D(tickFrame);
         a.E(0xC7, 0x05); a.D(pend); a.D(1);
+        if (ns != 0)
+        {
+            // netsync: a tick that starts more than half a phase late (the network held it back, or a long frame) moves the
+            // schedule to now instead of running the missed time in a burst. stock 30 fps never catches up either
+            a.E(0xFF, 0x05); a.D(ns + NsTicks);                                          // log: ticks started
+            a.E(0x8B, 0xD0, 0x2B, 0x15); a.D(t0);                                        // edx = now - tickStart
+            a.E(0x81, 0xFA); a.D((uint)(T / 6 + T / 12)); a.J(0x7E, "ontime");
+            a.E(0x8D, 0x90); a.D((uint)(-(T / 6))); a.E(0x89, 0x15); a.D(t0);            // tickStart = now - one phase
+            a.E(0xFF, 0x05); a.D(ns + NsLate);                                           // log: late starts
+            a.L("ontime");
+        }
         a.E(0x8B, 0xD0, 0x2B, 0x15); a.D(t0);                        // >2 ticks behind, resync
         a.E(0x81, 0xFA); a.D((uint)(2 * T)); a.J(0x7E, "pass");
         a.E(0xA3); a.D(t0); a.J(0xEB, "pass");
@@ -2070,7 +2129,7 @@ static class Program
     const string BfmeSpellStorePattern = "33 C0 39 44 24 04 75 ?? 38 44 24 0C 75 ?? 8B 0D ?? ?? ?? ?? 83 B9 ?? ?? 00 00 06 74 ?? 8B 0D ?? ?? ?? ?? 38 41 ?? B8 ?? ?? ?? ?? 74 ?? B8";
     const string BfmeScrollByPattern = "55 8B EC 83 EC 64 A1 ?? ?? ?? ?? 80 B8 C0 00 00 00 00 53 8B D9 74 06 80 7B 44 00 75 09 80 BB 01 25 00 00 00 74 07 33 C0 E9";
 
-    class BfmeSites { public uint Render, Logic, Limiter, TimeIat, FrameMs, FrameMsSetter, ScrollFunc, ScrollSlot, SpellStore, StoreJmp, StoreUpdate; public List<uint> Fps = new List<uint>(); public SchedSite Sched;
+    class BfmeSites { public uint Render, Logic, Limiter, TimeIat, NetScale, FrameMs, FrameMsSetter, ScrollFunc, ScrollSlot, SpellStore, StoreJmp, StoreUpdate; public List<uint> Fps = new List<uint>(); public SchedSite Sched;
         public List<Tuple<uint, byte[]>> Restore = new List<Tuple<uint, byte[]>>(); }
 
     static BfmeSites FindBfme(byte[] img)
@@ -2106,6 +2165,7 @@ static class Program
         uint lim = FindUnique(img, BfmeLimiterPattern);
         if (lim == 0) return null;
         b.Limiter = lim + 6; b.TimeIat = BitConverter.ToUInt32(img, (int)(lim + 2 - ImageBase));
+        b.NetScale = BitConverter.ToUInt32(img, (int)(lim + 13 - ImageBase));   // fmul [netscale]: D8 0D at +11
         uint set = FindUnique(img, BfmeFrameMsSetterPattern);
         if (set != 0 && BitConverter.ToUInt32(img, (int)(set - ImageBase) + 7) == b.FrameMs) b.FrameMsSetter = set;
         // the spell store's per-frame update (sends SetSpellButtonState to the flash movie, but only when a button's
@@ -2223,6 +2283,12 @@ static class Program
             var t = new List<byte> { 0xFF, 0x25 }; t.AddRange(BitConverter.GetBytes(b.TimeIat));
             Write(proc, m + 0xF80, t.ToArray());
             b.Sched.TimeFn = m + 0xF80;
+            if (netsyncOpt && b.NetScale != 0)
+            {
+                netsyncData = b.Sched.NetData = m + 0x1E00; b.Sched.NetScale = b.NetScale;
+                Write(proc, m + 0x1E00, new byte[NsK65536]);
+                Write(proc, m + 0x1E00 + NsK65536, BitConverter.GetBytes(65536f));
+            }
             PatchScheduler(proc, img, b.Sched, m, m);
         }
         FlushCode(proc);
@@ -2230,7 +2296,59 @@ static class Program
         patched = "patch memory 0x" + m.ToString("X") + "-0x" + (m + patchMemSize - 1).ToString("X") +
             (memOverlaps.Count > 0 ? "\r\nPATCH MEMORY OVERLAP (please report): " + string.Join(", ", memOverlaps.Distinct()) : "") + "\r\nsites: fps " + hex(b.Fps) + " | limiter " + hex(new[] { b.Limiter }) + " | animclock " + hex(new[] { b.FrameMsSetter }) + " | scroll " + hex(new[] { b.ScrollSlot }) + " | spellstore " + hex(new[] { b.SpellStore, b.StoreJmp }) +
             (b.Sched != null ? " | sched " + hex(new[] { b.Sched.Advance, b.Sched.Exit }) + string.Format(" phase {0:X} interp {1:X} dispatch {2:X}", b.Sched.Phase, b.Sched.Interp, b.Sched.Dispatch) : "") +
-            (b.Restore.Count > 0 ? " | restored stock code " + hex(b.Restore.Select(r => r.Item1)) : "");
+            (b.Restore.Count > 0 ? " | restored stock code " + hex(b.Restore.Select(r => r.Item1)) : "") +
+            "\r\nnetscale 0x" + b.NetScale.ToString("X") + " in " + SectionInfo(img, b.NetScale) +
+            ", value now " + BitConverter.ToSingle(Read(proc, b.NetScale, 4), 0).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+            " | netsync " + (b.Sched != null && b.Sched.NetData != 0 ? "on" : netsyncOpt ? "requested but not applied (no scheduler or netscale)" : "off");
+    }
+
+    // which section an address is in, for the log (a netscale in a read-only section would be a constant, not the network's)
+    static string SectionInfo(byte[] img, uint va)
+    {
+        int pe = BitConverter.ToInt32(img, 0x3C), n = BitConverter.ToUInt16(img, pe + 6);
+        int sec = pe + 24 + BitConverter.ToUInt16(img, pe + 20);
+        for (int i = 0; i < n; i++, sec += 40)
+        {
+            uint rva = BitConverter.ToUInt32(img, sec + 12), size = Math.Max(BitConverter.ToUInt32(img, sec + 8), BitConverter.ToUInt32(img, sec + 16));
+            if (va - ImageBase < rva || va - ImageBase >= rva + size) continue;
+            uint ch = BitConverter.ToUInt32(img, sec + 36);
+            return Encoding.ASCII.GetString(img, sec, 8).TrimEnd('\0') + ((ch & 0x80000000) != 0 ? " (writable)" : " (read-only)");
+        }
+        return "no section";
+    }
+
+    // netsync=1: once a second, while a game is running (ticks going up), log a line every 10 s with what the scheduler
+    // saw: ticks per second, how often the network held a tick back, late starts it re-anchored, and netscale.
+    // this is the part testers can't see, so it's what tells whether the fix is doing anything online
+    static void NetsyncLog(string dir)
+    {
+        try
+        {
+            if (netsyncData == 0) return;
+            Func<int, int> rd = off => Marshal.ReadInt32((IntPtr)(netsyncData + off));
+            int lastTicks = rd(NsTicks), lastHeld = rd(NsHeld), lastLate = rd(NsLate), quiet = 0;
+            int minScale = int.MaxValue, maxScale = 0;
+            var sw = Stopwatch.StartNew();
+            AppendLog(dir, DateTime.Now + "  netsync log on (a line every 10 s while a game runs)\r\n");
+            while (true)
+            {
+                Thread.Sleep(1000);
+                int s = rd(NsScale);
+                if (s > 0) { minScale = Math.Min(minScale, s); maxScale = Math.Max(maxScale, s); }
+                if (sw.ElapsedMilliseconds < 10000) continue;
+                int ticks = rd(NsTicks), held = rd(NsHeld), late = rd(NsLate);
+                double secs = sw.ElapsedMilliseconds / 1000.0;
+                sw.Restart();
+                if (ticks == lastTicks) { if (quiet++ == 0) AppendLog(dir, DateTime.Now + "  netsync: no ticks (menu / loading)\r\n"); continue; }
+                quiet = 0;
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                AppendLog(dir, string.Format(inv, "{0}  netsync: {1:0.00} ticks/s, held back {2}, late starts {3}, netscale {4:0.000}..{5:0.000}\r\n",
+                    DateTime.Now, (ticks - lastTicks) / secs, held - lastHeld, late - lastLate,
+                    minScale == int.MaxValue ? 0 : minScale / 65536.0, maxScale / 65536.0));
+                lastTicks = ticks; lastHeld = held; lastLate = late; minScale = int.MaxValue; maxScale = 0;
+            }
+        }
+        catch { }
     }
 
     static int IndexOf(byte[] img, byte[] what)
