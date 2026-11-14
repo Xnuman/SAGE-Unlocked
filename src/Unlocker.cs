@@ -2342,8 +2342,9 @@ static class Program
                 if (ticks == lastTicks) { if (quiet++ == 0) AppendLog(dir, DateTime.Now + "  netsync: no ticks (menu / loading)\r\n"); continue; }
                 quiet = 0;
                 var inv = System.Globalization.CultureInfo.InvariantCulture;
-                AppendLog(dir, string.Format(inv, "{0}  netsync: {1:0.00} ticks/s, held back {2}, late starts {3}, netscale {4:0.000}..{5:0.000}\r\n",
-                    DateTime.Now, (ticks - lastTicks) / secs, held - lastHeld, late - lastLate,
+                // the tick counter counts every start attempt, the held back ones (undone a frame later) included
+                AppendLog(dir, string.Format(inv, "{0}  netsync: {1:0.00} ticks/s ({2} start attempts, {3} held back), late starts {4}, netscale {5:0.000}..{6:0.000}\r\n",
+                    DateTime.Now, Math.Max(0, (ticks - lastTicks) - (held - lastHeld)) / secs, ticks - lastTicks, held - lastHeld, late - lastLate,
                     minScale == int.MaxValue ? 0 : minScale / 65536.0, maxScale / 65536.0));
                 lastTicks = ticks; lastHeld = held; lastLate = late; minScale = int.MaxValue; maxScale = 0;
             }
