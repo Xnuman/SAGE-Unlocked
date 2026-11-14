@@ -4,14 +4,10 @@ This is a fork of [TheeHorse/SAGE-Unlocked](https://github.com/TheeHorse/SAGE-Un
 
 To try it:
 
-1. Install the normal [SAGE Unlocked](https://github.com/TheeHorse/SAGE-Unlocked/releases) for your game.
-2. Download `CnCFpsUnlocker.dll` from this fork's [Releases](../../releases) and copy it over the one in your game folder.
-3. The fix is off by default. Add this line to `SAGEUnlocked.ini`:
+1. Download `SAGE-Unlocked-1.9.5-netsync-BFME2.zip` from this fork's [Releases](../../releases). It has the original SAGE Unlocked 1.9.5 `dinput8.dll`, this fork's `CnCFpsUnlocker.dll` and a `SAGEUnlocked.ini` with the fix turned on (`netsync=1`).
+2. Copy the 3 files into your game folder, next to `game.dat`.
+3. Start the game with `lotrbfme2.exe` / `lotrbfme2ep1.exe`. BFME Competitive Arena and the All In One Launcher disable these files, so for multiplayer play a LAN game over Radmin VPN or ZeroTier.
 
-```
-netsync=1
-```
-
-It's untested. Please play a multiplayer game with it and send your `SAGEUnlocked.log` (next to the game exe) in an issue here, together with what you saw: did units still jump?
+It's untested in multiplayer. Please play a multiplayer game with it and send every player's `SAGEUnlocked.log` (next to `game.dat`) in an issue here, together with what you saw: did units still jump?
 
 All credit for SAGE Unlocked goes to TheeHorse. GPL v3, see [LICENSE](LICENSE).
